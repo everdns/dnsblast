@@ -1,5 +1,4 @@
 #include "worker.h"
-#include "ratelimit.h"
 #include "clock.h"
 
 #include <cstdio>
@@ -153,17 +152,17 @@ void worker_main(WorkerCtx ctx) {
         epoll_ctl(epfd, EPOLL_CTL_ADD, fds[i], &ev);
     }
 
-    // Rate limiter
+    // Deadline-based pacer (replaces token bucket)
     uint64_t per_thread_qps = cfg.target_qps / (uint64_t)cfg.num_threads;
     if (per_thread_qps == 0) per_thread_qps = 1;
-    TokenBucket bucket;
-    bucket.init(per_thread_qps, 64);
+    uint64_t interval_ns = 1000000000ULL / per_thread_qps;
+    uint64_t pace_start = now_ns();
+    uint64_t packets_paced = 0;
 
     // TX state
     TxIdTracker tracker;
     tracker.reset();
 
-    uint64_t inter_packet_ns = 1000000000ULL / per_thread_qps;
     int socket_idx = 0;
 
     // Pre-allocate send/recv buffers
@@ -192,23 +191,21 @@ void worker_main(WorkerCtx ctx) {
     while (!ctx.stop_flag->load(std::memory_order_relaxed)) {
         if (query_idx >= my_limit) break;
 
-        // ── TX Phase ──
-        int wanted = std::min((int)(my_limit - query_idx), TX_BATCH);
-        int granted = bucket.consume(wanted);
+        // ── TX Phase: deadline-based pacing ──
+        // Wait until our next batch deadline (based on global start time)
+        uint64_t deadline = pace_start + packets_paced * interval_ns;
+        uint64_t now = now_ns();
+        if (now < deadline) {
+            while (now_ns() < deadline)
+                _mm_pause();
+        }
 
-        if (granted > 0) {
+        {
+            int batch_size = std::min((int)(my_limit - query_idx), TX_BATCH);
             int fd = fds[socket_idx % num_fds];
-            uint64_t batch_start = now_ns();
 
-            // Prepare batch
-            for (int i = 0; i < granted; i++) {
-                // Pace within batch
-                if (i > 0) {
-                    uint64_t target_time = batch_start + (uint64_t)i * inter_packet_ns;
-                    while (now_ns() < target_time)
-                        _mm_pause();
-                }
-
+            // Build entire batch without intra-packet pacing
+            for (int i = 0; i < batch_size; i++) {
                 uint64_t ts = now_ns();
                 const PrebuiltQuery& q = ctx.queries[(query_idx + (uint64_t)i) % ctx.num_queries];
                 memcpy(send_bufs[i], q.wire, q.wire_len);
@@ -227,20 +224,19 @@ void worker_main(WorkerCtx ctx) {
             }
 
             // Batched send
-            int sent = sendmmsg(fd, tx_msgs, (unsigned int)granted, MSG_DONTWAIT);
+            int sent = sendmmsg(fd, tx_msgs, (unsigned int)batch_size, MSG_DONTWAIT);
             if (sent > 0) {
                 stats.queries_sent += (uint64_t)sent;
                 query_idx += (uint64_t)sent;
+                packets_paced += (uint64_t)sent;
             }
-            if (sent < granted) {
+            if (sent < batch_size) {
                 // Some failed — count send errors for undelivered
-                int failed = granted - (sent > 0 ? sent : 0);
+                int failed = batch_size - (sent > 0 ? sent : 0);
                 stats.send_errors += (uint64_t)failed;
-                if (sent <= 0) {
-                    // Nothing sent — clear tracker slots we allocated
-                    // (they'll expire as timeouts on wrap-around — acceptable)
-                }
                 if (sent > 0) query_idx = std::min(query_idx, my_limit);
+                // Advance pacer even on failure to avoid burst catch-up
+                packets_paced += (uint64_t)failed;
             }
 
             socket_idx++;
