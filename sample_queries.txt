@@ -1,0 +1,10 @@
+010-000-000-001.sld.lan. A
+010-000-000-002.sld.lan. MX
+000-000-000-002.sld.lan. AAAA
+013-000-000-032.sld.lan. CNAME
+013-030-000-002.sld.lan. HTTPS
+example.com. A
+example.com. AAAA
+example.com. NS
+example.com. SOA
+example.com. TXT
