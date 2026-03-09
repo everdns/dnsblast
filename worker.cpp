@@ -16,8 +16,11 @@
 #include <immintrin.h> // _mm_pause
 
 // Maximum batch size for sendmmsg / recvmmsg
-static constexpr int TX_BATCH = 32;
+static constexpr int TX_BATCH = 64;
 static constexpr int RX_BATCH = 64;
+
+// Only drain RX every N TX iterations to reduce syscall overhead
+static constexpr int RX_EVERY = 4;
 
 // Tracker for outstanding queries: maps txid -> send timestamp.
 // 65536 slots indexed by 16-bit DNS transaction ID.
@@ -155,7 +158,6 @@ void worker_main(WorkerCtx ctx) {
     // Deadline-based pacer (replaces token bucket)
     uint64_t per_thread_qps = cfg.target_qps / (uint64_t)cfg.num_threads;
     if (per_thread_qps == 0) per_thread_qps = 1;
-    uint64_t interval_ns = 1000000000ULL / per_thread_qps;
     uint64_t pace_start = now_ns();
     uint64_t packets_paced = 0;
 
@@ -186,14 +188,16 @@ void worker_main(WorkerCtx ctx) {
 
     uint64_t query_idx = 0;
     uint64_t my_limit = ctx.my_query_limit;
+    int rx_counter = 0;
 
     // ──────────── Main Loop ────────────
     while (!ctx.stop_flag->load(std::memory_order_relaxed)) {
         if (query_idx >= my_limit) break;
 
         // ── TX Phase: deadline-based pacing ──
-        // Wait until our next batch deadline (based on global start time)
-        uint64_t deadline = pace_start + packets_paced * interval_ns;
+        // Compute deadline with full precision to avoid truncation drift:
+        //   deadline = pace_start + packets_paced * 1e9 / per_thread_qps
+        uint64_t deadline = pace_start + packets_paced * 1000000000ULL / per_thread_qps;
         uint64_t now = now_ns();
         if (now < deadline) {
             while (now_ns() < deadline)
@@ -242,8 +246,10 @@ void worker_main(WorkerCtx ctx) {
             socket_idx++;
         }
 
-        // ── RX Phase ──
-        // Non-blocking drain of all available responses across all sockets
+        // ── RX Phase (every RX_EVERY iterations to reduce syscall overhead) ──
+        if (++rx_counter < RX_EVERY) continue;
+        rx_counter = 0;
+
         struct epoll_event events[64];
         int nready = epoll_wait(epfd, events, 64, 0);
 
